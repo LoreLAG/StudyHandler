@@ -130,9 +130,9 @@ def get_browser_tabs(browser_name):
 
 
 def get_multiple_paths(app_name):
-    if app_name == "YouTube Music": return []
+    if app_name in ["YouTube Music", "Spotify", "WhatsApp"]: return []
 
-    # 1. METODO NATIVO APPLE (Office, Anteprima)
+    # 1. METODO APPLE (Office, Anteprima)
     app_target = "Preview" if app_name in ["Anteprima", "Preview"] else app_name
     doc_entities = {
         "Preview": ("document", "path"),
@@ -145,43 +145,79 @@ def get_multiple_paths(app_name):
         entity, prop = doc_entities[app_target]
         script = f'tell application "{app_target}" to return {prop} of every {entity}'
         res = run_applescript(script)
-        return [p.strip() for p in res.split(",") if p.strip()] if res else []
+        return [p.strip() for p in res.split(",") if p.strip() and "/" in p] if res else []
 
-    # 2. METODO UNIX "SPY" (Per MATLAB e Applicazioni Sviluppo)
-    # Lista di app da scansionare via lsof
-    dev_apps = ["MATLAB", "PyCharm", "Visual Studio Code", "Code", "IntelliJ IDEA", "Sublime Text", "WebStorm"]
+    # 2. METODO "WINDOW TITLE + SPOTLIGHT" (L'antidoto per PyCharm, VS Code, ecc.)
+    ide_apps = ["PyCharm", "Code", "Visual Studio Code", "IntelliJ", "Sublime", "WebStorm"]
 
-    if any(dev.lower() in app_name.lower() for dev in dev_apps):
-        # Estensioni da monitorare (matlab + programmazione)
-        dev_exts = [
-            ".m", ".mat", ".slx", ".mlx", ".fig",  # MATLAB
-            ".py", ".ipynb",  # Python
-            ".js", ".ts", ".html", ".css",  # Web
-            ".java", ".cpp", ".c", ".h", ".cs",  # System
-            ".json", ".yaml", ".xml", ".sql"  # Data
-        ]
+    if any(ide.lower() in app_name.lower() for ide in ide_apps):
+        # Chiediamo ad AppleScript di leggere i titoli delle finestre aperte dell'IDE
+        script = f'''
+        tell application "System Events"
+            try
+                set winNames to name of every window of application process "{app_name}"
+                set AppleScript's text item delimiters to "|||"
+                return winNames as text
+            end try
+        end tell
+        '''
+        res = run_applescript(script)
+        if not res: return []
+
+        projects = set()
+        for title in res.split("|||"):
+            title = title.strip()
+            if not title or title == app_name or title == "missing value": continue
+
+            # Caso A: Il percorso è direttamente nel titolo tra parentesi: "MioProg [~/percorso/MioProg] - main.py"
+            if " [" in title and "]" in title:
+                possible_path = title.split(" [")[1].split("]")[0]
+                possible_path = os.path.expanduser(possible_path)
+                if os.path.isdir(possible_path):
+                    projects.add(possible_path)
+                    continue
+
+            # Caso B: C'è solo il nome del progetto: "MioProgetto - main.py"
+            proj_name = title.split(' – ')[0].split(' - ')[0].strip()
+            if proj_name:
+                # Usiamo Spotlight per trovare istantaneamente la cartella esatta nel disco!
+                find_cmd = ['mdfind', f'kMDItemContentType == "public.folder" && kMDItemFSName == "{proj_name}"']
+                paths_str = subprocess.run(find_cmd, capture_output=True, text=True).stdout.strip()
+
+                if paths_str:
+                    for p in paths_str.split('\n'):
+                        if os.path.isdir(p):
+                            # Confermiamo che sia un vero progetto controllando se ha le cartelle nascoste di setup
+                            if any(os.path.exists(os.path.join(p, d)) for d in [".idea", ".vscode", ".git"]):
+                                projects.add(p)
+                                break
+
+        return list(projects)
+
+    # 3. METODO UNIX LSOF (Solo per MATLAB, che tiene fisicamente i file bloccati in RAM)
+    if "MATLAB" in app_name:
         try:
-            # Trova il PID dell'app (es. 'PyCharm' o 'Code')
-            pids_str = subprocess.run(["pgrep", "-i", app_name], capture_output=True, text=True).stdout.strip()
-            if not pids_str:
-                # Prova con il nome abbreviato per VS Code
-                if "Code" in app_name:
-                    pids_str = subprocess.run(["pgrep", "-i", "Electron"], capture_output=True,
-                                              text=True).stdout.strip()
-                if not pids_str: return []
+            pid_script = f'tell application "System Events" to return unix id of application process "{app_name}"'
+            main_pid = run_applescript(pid_script)
+            if not main_pid or not main_pid.isdigit(): return []
 
-            open_files = set()
-            for pid in pids_str.split('\n'):
-                lsof_out = subprocess.run(["lsof", "-p", pid], capture_output=True, text=True).stdout
-                for line in lsof_out.split('\n'):
-                    parts = line.split(maxsplit=8)
-                    if len(parts) >= 9:
-                        path = parts[8]
-                        if any(path.lower().endswith(ext) for ext in dev_exts) and os.path.exists(path):
-                            # Escludiamo file interni alle librerie o file temporanei
-                            if "/lib/" not in path and "/Contents/" not in path and ".git/" not in path:
-                                open_files.add(path)
-            return list(open_files)
+            pids = [main_pid]
+            child_pids = subprocess.run(["pgrep", "-P", main_pid], capture_output=True,
+                                        text=True).stdout.strip().split()
+            pids.extend(child_pids)
+
+            pid_list = ",".join(set(pids))
+            open_items = set()
+
+            lsof_out = subprocess.run(["lsof", "-p", pid_list], capture_output=True, text=True).stdout
+            for line in lsof_out.split('\n'):
+                parts = line.split(maxsplit=8)
+                if len(parts) >= 9:
+                    path = parts[8].strip()
+                    if any(path.endswith(ext) for ext in [".m", ".mat", ".slx", ".mlx", ".fig"]):
+                        if os.path.exists(path) and os.path.isfile(path):
+                            open_items.add(path)
+            return list(open_items)
         except:
             return []
 
@@ -301,50 +337,51 @@ class StudyManagerGUI(ctk.CTk):
     def _background_scan(self):
         current = {}
         url_profs = self.settings.get("url_profiles", {})
-        active_apps_info = get_active_apps_info()
+        active_apps_info = get_active_apps_info()  # La funzione che abbiamo creato prima
         active_app_names = list(active_apps_info.keys())
 
-        # Lista dei browser supportati per la lettura delle schede
+        # 1. SCANNER BROWSER (Chrome, Safari, etc.)
         supported_browsers = ["Google Chrome", "Safari", "Microsoft Edge", "Brave Browser"]
-
-        # 1. BROWSER SCANNING
         for browser in supported_browsers:
             if browser in active_app_names:
                 for t in get_browser_tabs(browser):
-                    # Solo Chrome usa i profili nel nostro script per ora
                     prof_name = url_profs.get(t['url'], "Default") if browser == "Google Chrome" else ""
-                    prof_tag = f"[{prof_name}] " if prof_name else ""
-
-                    display_text = f"🌐 {prof_tag}{t['title']}"
                     key = f"{t['url']}"
-
                     current[key] = {
-                        "type": "url",
-                        "value": t['url'],
-                        "parent_app": browser,  # Salviamo il browser esatto che ha aperto questo link
-                        "text": display_text,
-                        "default": False,
-                        "profile": prof_name
+                        "type": "url", "value": t['url'], "parent_app": browser,
+                        "text": f"🌐 {f'[{prof_name}] ' if prof_name else ''}{t['title']}",
+                        "default": False
                     }
 
-        # 2. APPS E FILES SCANNING
+        # 2. SCANNER APPLICAZIONI E FILE (MATLAB, PyCharm, Word, etc.)
         for app_name, exact_path in active_apps_info.items():
             if app_name in supported_browsers: continue
-            paths = get_multiple_paths(app_name)
-            if paths:
-                for p in paths:
-                    key = p
-                    current[key] = {"type": "file", "value": p, "parent_app": app_name,
-                                    "text": f"📄 {os.path.basename(p)}", "default": True}
+
+            # Chiediamo quali file/progetti sono aperti nell'app
+            files = get_multiple_paths(app_name)
+
+            if files:
+                # Se ci sono file/progetti, creiamo una riga per ognuno
+                for f_path in files:
+                    key = f_path
+                    # Scegliamo l'icona giusta: Cartella per i progetti, foglio per i file
+                    icon = "📁" if os.path.isdir(f_path) else "📄"
+
+                    current[key] = {
+                        "type": "file",  # Usiamo 'file' perché passiamo un percorso al terminale
+                        "value": f_path,
+                        "parent_app": app_name,
+                        "text": f"{icon} {os.path.basename(f_path)}",
+                        "default": True
+                    }
             else:
+                # Se non ci sono file, mostriamo solo l'app stessa
                 key = app_name
                 icon = "🎵" if app_name == "YouTube Music" else "🖥️"
-
-                # NUOVO: Salviamo l'exact_path direttamente nell'oggetto
                 current[key] = {
                     "type": "app",
                     "value": app_name,
-                    "app_path": exact_path,  # <-- Memorizziamo il percorso reale
+                    "app_path": exact_path,
                     "parent_app": app_name,
                     "text": f"{icon} {app_name}",
                     "default": True

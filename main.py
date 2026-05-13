@@ -1,244 +1,382 @@
 import customtkinter as ctk
-from tkinter import messagebox, simpledialog
+import tkinter as tk
+from tkinter import messagebox
 import subprocess
 import json
 import os
+import threading
+import platform
+from pathlib import Path
+
+# --- MAC DARK MODE FIX ---
+_original_mac_ver = platform.mac_ver
+
+
+def _patched_mac_ver():
+    ver = _original_mac_ver()
+    if not ver[0]: return ('10.15.0', ('', '', ''), 'x86_64')
+    return ver
+
+
+platform.mac_ver = _patched_mac_ver
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
-CARTELLA_PROFILI = "sessioni_studio_mac"
+# --- PATH CONFIGURATION ---
+APP_DIR = os.path.expanduser("~/.study_manager")
+SESSIONS_DIR = os.path.join(APP_DIR, "sessions")
+SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
+CHROME_USER_DATA = os.path.expanduser("~/Library/Application Support/Google/Chrome")
 
 
 def setup():
-    if not os.path.exists(CARTELLA_PROFILI):
-        os.makedirs(CARTELLA_PROFILI)
+    for d in [APP_DIR, SESSIONS_DIR]:
+        if not os.path.exists(d): os.makedirs(d)
+    if not os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump({"app_defaults": {}, "url_profiles": {}}, f)
 
 
-def esegui_applescript(script):
+def get_chrome_profiles():
+    profiles = {"Default": "Default"}
+    local_state = os.path.join(CHROME_USER_DATA, "Local State")
     try:
-        process = subprocess.Popen(['osascript', '-e', script], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = process.communicate()
-        if process.returncode == 0:
-            return out.decode('utf-8').strip()
+        with open(local_state, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            cache = data.get("profile", {}).get("info_cache", {})
+            for folder, info in cache.items():
+                profiles[info.get("name")] = folder
+    except:
+        pass
+    return profiles
+
+
+def save_setting(category, key, value):
+    data = load_settings()
+    data[category][key] = value
+    with open(SETTINGS_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
+
+
+def load_settings():
+    default_structure = {"app_defaults": {}, "url_profiles": {}}
+    try:
+        with open(SETTINGS_FILE, 'r') as f:
+            data = json.load(f)
+            for key in default_structure:
+                if key not in data: data[key] = {}
+            return data
+    except:
+        return default_structure
+
+
+# --- APPLESCRIPTS ---
+def run_applescript(script):
+    try:
+        proc = subprocess.Popen(['osascript', '-e', script], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, _ = proc.communicate()
+        return out.decode('utf-8').strip() if proc.returncode == 0 else None
+    except:
         return None
-    except Exception:
-        return None
 
 
-def ottieni_percorsi_multipli(app_name):
-    """Esegue un loop in AppleScript per trovare TUTTI i file aperti di quell'app."""
-    app_target = app_name
-    if app_name == "Anteprima":
-        app_target = "Preview"
-
-    # Dizionario che dice ad AppleScript dove cercare in base all'app
-    doc_entities = {
-        "Preview": ("documents", "path"),
-        "Anteprima": ("documents", "path"),
-        "Microsoft Word": ("documents", "full name"),
-        "Microsoft Excel": ("workbooks", "full name"),
-        "Microsoft PowerPoint": ("presentations", "full name")
-    }
-
-    if app_name not in doc_entities:
-        return []
-
-    entita, proprieta = doc_entities[app_name]
-
-    # Questo script interroga tutte le finestre dell'app e unisce i percorsi con un separatore "|||"
-    script = f'''
-    tell application "{app_target}"
-        set pathList to {{}}
-        repeat with doc in {entita}
-            try
-                set docPath to {proprieta} of doc
-                if docPath is not missing value then
-                    set end of pathList to docPath
-                end if
-            end try
-        end repeat
-        set AppleScript's text item delimiters to "|||"
-        return pathList as text
-    end tell
-    '''
-
-    risultato = esegui_applescript(script)
-    if risultato:
-        # Separiamo la stringa in una vera lista Python
-        return [p.strip() for p in risultato.split("|||") if p.strip()]
-    return []
-
-
-def ottieni_app_attive():
+def get_all_chrome_tabs():
     script = '''
-    tell application "System Events"
-        set activeApps to name of every application process whose visible is true
-    end tell
-    set AppleScript's text item delimiters to ","
-    return activeApps as text
-    '''
-    risultato = esegui_applescript(script)
-    if risultato:
-        app_list = [app.strip() for app in risultato.split(',')]
-        da_ignorare = ["Finder", "Terminal", "Python", "Mac Study Manager", "Code", "System Settings"]
-        return [app for app in app_list if app not in da_ignorare]
-    return []
+    tell application "Google Chrome"
+        set tabData to {}
+        try
+            repeat with w in windows
+                repeat with t in tabs of w
+                    set end of tabData to (title of t & "###" & URL of t)
+                end repeat
+            end repeat
+        end try
+        set AppleScript's text item delimiters to "|||"
+        return tabData as text
+    end tell'''
+    res = run_applescript(script)
+    if not res: return []
+    results = []
+    seen = set()
+    for item in res.split("|||"):
+        if "###" in item:
+            title, url = item.split("###")
+            if url not in seen:
+                results.append({"title": title, "url": url})
+                seen.add(url)
+    return results
 
 
-def ottieni_url_browser(browser_name):
-    if browser_name == "Safari":
-        return esegui_applescript('tell application "Safari" to return URL of front document')
-    elif browser_name in ["Google Chrome", "Chrome"]:
-        return esegui_applescript('tell application "Google Chrome" to return URL of active tab of front window')
-    return None
+def get_multiple_paths(app_name):
+    app_target = "Preview" if app_name in ["Anteprima", "Preview"] else app_name
+    doc_entities = {"Preview": ("documents", "path"), "Microsoft Word": ("documents", "full name"),
+                    "Microsoft Excel": ("workbooks", "full name"),
+                    "Microsoft PowerPoint": ("presentations", "full name")}
+    if app_name not in doc_entities: return []
+    entity, prop = doc_entities[app_name]
+    script = f'tell application "{app_target}" to return {prop} of every {entity}'
+    res = run_applescript(script)
+    return [p.strip() for p in res.split(",") if p.strip()] if res else []
+
+
+def get_active_apps():
+    script = 'tell application "System Events" to return name of every application process whose visible is true'
+    res = run_applescript(script)
+    if not res: return []
+    to_ignore = ["Finder", "Terminal", "Python", "Study Manager", "Code", "System Settings", "app_mode_loader"]
+    return [app.strip() for app in res.split(',') if app.strip() not in to_ignore]
+
+
+def center_window(window, width, height):
+    window.update_idletasks()
+    x = int((window.winfo_screenwidth() / 2) - (width / 2))
+    y = int((window.winfo_screenheight() / 2) - (height / 2))
+    window.geometry(f"{width}x{height}+{x}+{y}")
 
 
 class StudyManagerGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
-
-        self.title("Mac Study Manager v3")
-        self.geometry("500x650")
-
+        self.withdraw()
+        self.title("Study Manager")
         setup()
-        self.elementi_trovati = {}
+
+        self.settings = load_settings()
+        self.chrome_profiles = get_chrome_profiles()
+        self.current_session_name = None
+        self.saved_data = []
+        self.found_items = {}
         self.checkbox_vars = {}
+        self.app_frames = {}
+        self.is_scanning = False
 
-        # UI Principale
-        self.label_titolo = ctk.CTkLabel(self, text="📚 Gestore Studio Avanzato",
-                                         font=ctk.CTkFont(size=20, weight="bold"))
-        self.label_titolo.pack(pady=15)
+        self.lbl_session = ctk.CTkLabel(self, text="No Active Session", font=ctk.CTkFont(size=18, weight="bold"))
+        self.lbl_session.pack(pady=(15, 0))
+        self.lbl_status = ctk.CTkLabel(self, text="New / Unsaved", font=ctk.CTkFont(size=12), text_color="gray")
+        self.lbl_status.pack(pady=(0, 10))
+        self.btn_scan = ctk.CTkButton(self, text="🔍 Refresh Current View", command=self.force_manual_scan)
+        self.btn_scan.pack(fill="x", padx=30, pady=5)
+        self.frame_list = ctk.CTkScrollableFrame(self, label_text="Elements (Right-Click for Profiles/Defaults)")
+        self.frame_list.pack(fill="both", expand=True, padx=30, pady=10)
 
-        self.btn_scansiona = ctk.CTkButton(self, text="🔍 Scansiona App e File Aperti", command=self.scansiona)
-        self.btn_scansiona.pack(fill="x", padx=30, pady=5)
+        ctk.CTkButton(self, text="💾 Save Session", command=self.save_session, fg_color="#28a745").pack(fill="x",
+                                                                                                       padx=30, pady=5)
+        ctk.CTkButton(self, text="🛑 Close Selected Apps", command=self.close_apps, fg_color="#dc3545").pack(fill="x",
+                                                                                                            padx=30,
+                                                                                                            pady=5)
+        ctk.CTkButton(self, text="📂 Change / Open Session", command=self.restore_menu, fg_color="#17a2b8").pack(
+            fill="x", padx=30, pady=(10, 20))
 
-        self.frame_lista = ctk.CTkScrollableFrame(self, label_text="Elementi Rilevati")
-        self.frame_lista.pack(fill="both", expand=True, padx=30, pady=15)
+        center_window(self, 650, 750)
+        self.deiconify()
+        self.trigger_scan()
+        self.auto_scan_loop()
 
-        self.btn_salva = ctk.CTkButton(self, text="💾 Salva Sessione", command=self.salva_sessione, fg_color="#28a745",
-                                       hover_color="#218838")
-        self.btn_salva.pack(fill="x", padx=30, pady=5)
+    def auto_scan_loop(self):
+        self.trigger_scan()
+        self.after(5000, self.auto_scan_loop)
 
-        self.btn_chiudi = ctk.CTkButton(self, text="🛑 Chiudi App Selezionate", command=self.chiudi_sessione,
-                                        fg_color="#dc3545", hover_color="#c82333")
-        self.btn_chiudi.pack(fill="x", padx=30, pady=5)
+    def force_manual_scan(self):
+        """Eseguita quando l'utente clicca il tasto Refresh."""
+        self.lbl_status.configure(text="Scanning...", text_color="#17a2b8")
+        # Forziamo la scansione anche se il timer non è scaduto
+        self.trigger_scan(force=True)
 
-        self.divisore = ctk.CTkFrame(self, height=2, fg_color=("gray70", "gray30"))
-        self.divisore.pack(fill="x", padx=50, pady=10)
+    def trigger_scan(self, force=False):
+        """Avvia la scansione in background."""
+        # Se non sta già scansionando, oppure se è un comando forzato
+        if not self.is_scanning:
+            self.is_scanning = True
+            threading.Thread(target=self._background_scan, daemon=True).start()
 
-        self.btn_ripristina = ctk.CTkButton(self, text="🚀 Menu Ripristino Sessione", command=self.menu_ripristino,
-                                            fg_color="#17a2b8", hover_color="#138496")
-        self.btn_ripristina.pack(fill="x", padx=30, pady=(0, 20))
+    def _background_scan(self):
+        current = {}
+        url_profs = self.settings.get("url_profiles", {})
 
-    def scansiona(self):
-        # Pulisce UI
-        for widget in self.frame_lista.winfo_children():
-            widget.destroy()
-        self.checkbox_vars.clear()
-        self.elementi_trovati.clear()
+        # Chrome Scanning
+        for t in get_all_chrome_tabs():
+            # Recuperiamo il nome del profilo associato all'URL (se esiste)
+            prof_name = url_profs.get(t['url'], "Default")
 
-        app_attive = ottieni_app_attive()
+            # Creiamo un testo descrittivo che include il profilo
+            display_text = f"🌐 [{prof_name}] {t['title']}"
+            key = f"{display_text} | {t['url']}"
 
-        for app in app_attive:
-            # 1. Browser
-            if app in ["Safari", "Google Chrome", "Chrome"]:
-                url = ottieni_url_browser(app)
-                if url and "http" in url:
-                    self._aggiungi_checkbox("url", url, app, f"🌐 {app}: {url[:40]}...")
-                else:
-                    self._aggiungi_checkbox("app", app, app, f"🖥️ {app} (Nessuna pagina)")
+            current[key] = {
+                "type": "url",
+                "value": t['url'],
+                "parent_app": "Google Chrome",
+                "text": display_text,
+                "default": False,
+                "profile": prof_name
+            }
 
-            # 2. App Documenti (Supporta file multipli)
-            elif app in ["Preview", "Anteprima", "Microsoft Word", "Microsoft Excel", "Microsoft PowerPoint"]:
-                percorsi = ottieni_percorsi_multipli(app)
-                if percorsi:
-                    for percorso in percorsi:
-                        nome_file = os.path.basename(percorso)
-                        self._aggiungi_checkbox("file", percorso, app, f"📄 {app}: {nome_file}")
-                else:
-                    self._aggiungi_checkbox("app", app, app, f"🖥️ {app} (Aperta ma senza file)")
-
-            # 3. App generiche
+        # Apps & Files Scanning
+        for app in get_active_apps():
+            if app == "Google Chrome": continue
+            paths = get_multiple_paths(app)
+            if paths:
+                for p in paths:
+                    key = f"📄 {os.path.basename(p)} | {p}"
+                    current[key] = {"type": "file", "value": p, "parent_app": app, "text": f"📄 {os.path.basename(p)}",
+                                    "default": True}
             else:
-                self._aggiungi_checkbox("app", app, app, f"🖥️ {app}")
+                key = f"🖥️ {app} | {app}"
+                current[key] = {"type": "app", "value": app, "parent_app": app, "text": f"🖥️ {app}", "default": True}
 
-    def _aggiungi_checkbox(self, tipo, valore, app_madre, testo_display):
-        """Metodo helper per creare le spunte grafiche"""
-        # Creiamo una chiave unica nel caso ci siano file con lo stesso nome
-        chiave = f"{testo_display} | {valore}"
+        self.after(0, lambda: self._apply_results(current))
 
-        chk = ctk.CTkCheckBox(self.frame_lista, text=testo_display)
-        chk.select()
-        chk.pack(fill="x", padx=5, pady=5)
+    def _apply_results(self, current):
+        keys_to_remove = [k for k in list(self.found_items.keys()) if k not in current]
+        for k in keys_to_remove:
+            p_app = self.found_items[k]["parent_app"]
+            if k in self.checkbox_vars:
+                self.checkbox_vars[k].destroy()
+                del self.checkbox_vars[k]
+            del self.found_items[k]
+            if p_app in self.app_frames:
+                if len(self.app_frames[p_app].winfo_children()) <= 1:
+                    self.app_frames[p_app].destroy()
+                    del self.app_frames[p_app]
 
-        self.checkbox_vars[chiave] = chk
-        self.elementi_trovati[chiave] = {"tipo": tipo, "valore": valore, "app_madre": app_madre}
-
-    def salva_sessione(self):
-        if not self.checkbox_vars: return
-        nome = simpledialog.askstring("Salva", "Nome materia (es. Matematica):")
-        if not nome: return
-
-        da_salvare = [self.elementi_trovati[chiave] for chiave, chk in self.checkbox_vars.items() if chk.get() == 1]
-
-        with open(os.path.join(CARTELLA_PROFILI, f"{nome.lower()}.json"), 'w') as f:
-            json.dump(da_salvare, f, indent=4)
-        messagebox.showinfo("OK", "Sessione salvata con successo!")
-
-    def chiudi_sessione(self):
-        # NOTA: AppleScript usa il comando 'quit' sull'intera app, quindi chiuderà tutti i file di quell'app.
-        app_da_chiudere = set(
-            self.elementi_trovati[chiave]["app_madre"] for chiave, chk in self.checkbox_vars.items() if chk.get() == 1)
-        for app in app_da_chiudere:
-            esegui_applescript(f'tell application "{app}" to quit')
-
-    def menu_ripristino(self):
-        file_salvati = [f.replace(".json", "") for f in os.listdir(CARTELLA_PROFILI) if f.endswith(".json")]
-
-        if not file_salvati:
-            messagebox.showwarning("Attenzione", "Nessuna sessione salvata trovata.")
-            return
-
-        # Creiamo una sottofinestra elegante per scegliere
-        popup = ctk.CTkToplevel(self)
-        popup.title("Scegli Sessione")
-        popup.geometry("350x200")
-        popup.transient(self)  # Lega il popup alla finestra madre
-        popup.grab_set()  # Blocca i bottoni sotto finché non chiudi il popup
-
-        ctk.CTkLabel(popup, text="Seleziona la materia da avviare:", font=ctk.CTkFont(size=16, weight="bold")).pack(
-            pady=(20, 10))
-
-        # Menu a tendina nativo di CustomTkinter
-        opzione_selezionata = ctk.StringVar(value=file_salvati[0])
-        dropdown = ctk.CTkOptionMenu(popup, variable=opzione_selezionata, values=file_salvati)
-        dropdown.pack(pady=10, padx=30, fill="x")
-
-        def conferma_avvio():
-            nome = opzione_selezionata.get()
-            popup.destroy()  # Chiude il popup
-            self._esegui_ripristino(nome)
-
-        ctk.CTkButton(popup, text="🚀 Avvia", command=conferma_avvio, fg_color="#17a2b8").pack(pady=10)
-
-    def _esegui_ripristino(self, nome_sessione):
-        path = os.path.join(CARTELLA_PROFILI, f"{nome_sessione.lower()}.json")
-        if not os.path.exists(path): return
-
-        with open(path, 'r') as f:
-            dati = json.load(f)
-
-        for item in dati:
-            if item["tipo"] == "file":
-                subprocess.run(["open", item["valore"]])
-            elif item["tipo"] == "url":
-                subprocess.run(["open", "-a", item["app_madre"], item["valore"]])
+        for k, d in current.items():
+            if k not in self.found_items:
+                p_app = d["parent_app"]
+                if p_app not in self.app_frames:
+                    f = ctk.CTkFrame(self.frame_list, fg_color="transparent")
+                    f.pack(fill="x", pady=5)
+                    ctk.CTkLabel(f, text=p_app.upper(), font=ctk.CTkFont(size=13, weight="bold"),
+                                 text_color="#17a2b8").pack(anchor="w", padx=5)
+                    self.app_frames[p_app] = f
+                self._add_checkbox(d, k, self.app_frames[p_app])
+                self.found_items[k] = d
             else:
-                subprocess.run(["open", "-a", item["valore"]])
+                self.found_items[k].update(d)
+
+        for app_name in sorted(self.app_frames.keys()):
+            self.app_frames[app_name].pack(fill="x", pady=5)
+
+        self.check_dirty_state()
+        self.is_scanning = False
+        if self.current_session_name:
+            self.lbl_status.configure(text="Synced", text_color="gray")
+        else:
+            self.lbl_status.configure(text="Ready", text_color="gray")
+
+    def _add_checkbox(self, data, key, parent_frame):
+        chk = ctk.CTkCheckBox(parent_frame, text=data["text"], command=self.check_dirty_state)
+        chk.pack(fill="x", padx=(25, 5), pady=2)
+        p_app = data["parent_app"]
+        pref = self.settings.get("app_defaults", {}).get(p_app, data["default"])
+        if pref:
+            chk.select()
+        else:
+            chk.deselect()
+        self.checkbox_vars[key] = chk
+        u_val = data.get("value") if data["type"] == "url" else None
+        chk.bind("<Button-2>", lambda e, a=p_app, u=u_val: self.show_context_menu(e, a, u))
+        chk.bind("<Button-3>", lambda e, a=p_app, u=u_val: self.show_context_menu(e, a, u))
+        chk._text_label.bind("<Button-2>", lambda e, a=p_app, u=u_val: self.show_context_menu(e, a, u))
+        chk._text_label.bind("<Button-3>", lambda e, a=p_app, u=u_val: self.show_context_menu(e, a, u))
+
+    def show_context_menu(self, event, app_name, url=None):
+        menu = tk.Menu(self, tearoff=0)
+        if app_name == "Google Chrome" and url:
+            p_menu = tk.Menu(menu, tearoff=0)
+            for name in self.chrome_profiles.keys():
+                p_menu.add_command(label=name, command=lambda n=name, u=url: self.set_url_profile(u, n))
+            menu.add_cascade(label="Assign Chrome Profile", menu=p_menu)
+            menu.add_separator()
+        menu.add_command(label=f"Default SELECT {app_name}", command=lambda: self.set_app_default(app_name, True))
+        menu.add_command(label=f"Default DESELECT {app_name}", command=lambda: self.set_app_default(app_name, False))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def set_url_profile(self, url, profile):
+        save_setting("url_profiles", url, profile)
+        self.settings = load_settings()
+        messagebox.showinfo("Profile Assigned", f"URL linked to profile: {profile}")
+
+    def set_app_default(self, app, state):
+        save_setting("app_defaults", app, state)
+        self.settings = load_settings()
+        self.trigger_scan()
+
+    def check_dirty_state(self):
+        curr = sorted([v["value"] for k, v in self.found_items.items() if self.checkbox_vars[k].get() == 1])
+        saved = sorted([v["value"] for v in self.saved_data])
+        is_dirty = curr != saved
+        if self.current_session_name:
+            self.lbl_session.configure(text=f"{self.current_session_name}{' (*)' if is_dirty else ''}",
+                                       text_color="#dc3545" if is_dirty else "white")
+            self.lbl_status.configure(text="Unsaved Changes" if is_dirty else "Synced")
+        else:
+            self.lbl_session.configure(text="New Session", text_color="gray")
+
+    def save_session(self):
+        if not self.current_session_name:
+            name = ctk.CTkInputDialog(text="Session Name:", title="Save").get_input()
+            if not name: return
+            self.current_session_name = name
+        to_save = [v for k, v in self.found_items.items() if self.checkbox_vars[k].get() == 1]
+        self.saved_data = to_save
+        with open(os.path.join(SESSIONS_DIR, f"{self.current_session_name}.json"), 'w') as f:
+            json.dump(to_save, f, indent=4)
+        self.check_dirty_state()
+        messagebox.showinfo("Saved", f"Session {self.current_session_name} updated.")
+
+    def close_apps(self):
+        apps = set(v["parent_app"] for k, v in self.found_items.items() if self.checkbox_vars[k].get() == 1)
+        for a in apps: run_applescript(f'tell application "{a}" to quit')
+
+    def restore_menu(self):
+        files = [f.replace(".json", "") for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")]
+        pop = ctk.CTkToplevel(self);
+        pop.title("Open Session");
+        center_window(pop, 500, 400);
+        pop.transient(self)
+        txt = ctk.CTkTextbox(pop, height=180, state="disabled")
+
+        def preview(c):
+            with open(os.path.join(SESSIONS_DIR, f"{c}.json"), 'r') as f: data = json.load(f)
+            txt.configure(state="normal");
+            txt.delete("1.0", "end")
+            for i in data: txt.insert("end", f"{'🌐' if i['type'] == 'url' else '📄'} {i['parent_app']}: {i['value']}\n")
+            txt.configure(state="disabled")
+
+        if files:
+            sel = ctk.StringVar(value=files[0])
+            ctk.CTkOptionMenu(pop, variable=sel, values=files, command=preview).pack(pady=10, padx=30, fill="x")
+            txt.pack(pady=10, padx=30, fill="both", expand=True);
+            preview(files[0])
+            ctk.CTkButton(pop, text="🚀 Open Selected",
+                          command=lambda: [self._load_session(sel.get()), pop.destroy()]).pack(pady=5, padx=30,
+                                                                                               fill="x")
+        ctk.CTkButton(pop, text="➕ New Blank", fg_color="gray",
+                      command=lambda: [self._new_session(), pop.destroy()]).pack(pady=10, padx=30, fill="x")
+
+    def _new_session(self):
+        self.current_session_name = None;
+        self.saved_data = []
+        for w in self.frame_list.winfo_children(): w.destroy()
+        self.checkbox_vars.clear();
+        self.found_items.clear();
+        self.app_frames.clear();
+        self.trigger_scan()
+
+    def _load_session(self, name):
+        self.current_session_name = name
+        with open(os.path.join(SESSIONS_DIR, f"{name}.json"), 'r') as f:
+            self.saved_data = json.load(f)
+        for i in self.saved_data:
+            if i["type"] == "url" and i["parent_app"] == "Google Chrome":
+                folder = self.chrome_profiles.get(i.get("profile", "Default"), "Default")
+                os.system(f"open -na 'Google Chrome' --args --profile-directory='{folder}' '{i['value']}'")
+            else:
+                subprocess.run(["open", i["value"]])
+        self.after(2000, self.trigger_scan)
 
 
 if __name__ == "__main__":
     app = StudyManagerGUI()
-    app.after(100, lambda: app.focus_force())
     app.mainloop()

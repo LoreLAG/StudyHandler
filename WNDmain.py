@@ -72,8 +72,13 @@ def get_browser_url(hwnd):
 
 def center_window(window, width, height):
     window.update_idletasks()
-    x = int((window.winfo_screenwidth() / 2) - (width / 2))
-    y = int((window.winfo_screenheight() / 2) - (height / 2))
+    # Calcolo coordinate
+    screen_width = window.winfo_screenwidth()
+    screen_height = window.winfo_screenheight()
+    x = int((screen_width / 2) - (width / 2))
+    y = int((screen_height / 2) - (height / 2))
+
+    # Imposta la geometria PRIMA di mostrare la finestra
     window.geometry(f"{width}x{height}+{x}+{y}")
 
 

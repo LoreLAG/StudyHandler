@@ -130,8 +130,13 @@ def get_active_apps():
 
 def center_window(window, width, height):
     window.update_idletasks()
-    x = int((window.winfo_screenwidth() / 2) - (width / 2))
-    y = int((window.winfo_screenheight() / 2) - (height / 2))
+    # Calcolo coordinate
+    screen_width = window.winfo_screenwidth()
+    screen_height = window.winfo_screenheight()
+    x = int((screen_width / 2) - (width / 2))
+    y = int((screen_height / 2) - (height / 2))
+
+    # Imposta la geometria PRIMA di mostrare la finestra
     window.geometry(f"{width}x{height}+{x}+{y}")
 
 
@@ -140,6 +145,7 @@ class StudyManagerGUI(ctk.CTk):
         super().__init__()
         self.withdraw()
         self.title("Study Manager")
+        self.attributes("-alpha", 0)
         setup()
 
         self.settings = load_settings()
@@ -168,7 +174,10 @@ class StudyManagerGUI(ctk.CTk):
         ctk.CTkButton(self, text="📂 Change / Open Session", command=self.restore_menu, fg_color="#17a2b8").pack(
             fill="x", padx=30, pady=(10, 20))
 
-        center_window(self, 650, 750)
+        center_window(self, 750, 750)
+
+        # Un piccolo delay assicura che il window manager abbia processato il geometry
+        self.after(100, lambda: self.attributes("-alpha", 1.0))
         self.deiconify()
         self.trigger_scan()
         self.auto_scan_loop()
@@ -333,6 +342,7 @@ class StudyManagerGUI(ctk.CTk):
         files = [f.replace(".json", "") for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")]
         pop = ctk.CTkToplevel(self);
         pop.title("Open Session");
+        pop.attributes("-alpha", 0)
         center_window(pop, 500, 400);
         pop.transient(self)
         txt = ctk.CTkTextbox(pop, height=180, state="disabled")
@@ -349,19 +359,20 @@ class StudyManagerGUI(ctk.CTk):
             ctk.CTkOptionMenu(pop, variable=sel, values=files, command=preview).pack(pady=10, padx=30, fill="x")
             txt.pack(pady=10, padx=30, fill="both", expand=True);
             preview(files[0])
-            ctk.CTkButton(pop, text="🚀 Open Selected",
+            ctk.CTkButton(pop, text="Open Selected",
                           command=lambda: [self._load_session(sel.get()), pop.destroy()]).pack(pady=5, padx=30,
                                                                                                fill="x")
         ctk.CTkButton(pop, text="➕ New Blank", fg_color="gray",
                       command=lambda: [self._new_session(), pop.destroy()]).pack(pady=10, padx=30, fill="x")
+        pop.after(100, lambda: pop.attributes("-alpha", 1.0))
 
     def _new_session(self):
         self.current_session_name = None;
         self.saved_data = []
         for w in self.frame_list.winfo_children(): w.destroy()
-        self.checkbox_vars.clear();
-        self.found_items.clear();
-        self.app_frames.clear();
+        self.checkbox_vars.clear()
+        self.found_items.clear()
+        self.app_frames.clear()
         self.trigger_scan()
 
     def _load_session(self, name):

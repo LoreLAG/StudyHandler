@@ -132,7 +132,7 @@ def get_browser_tabs(browser_name):
 def get_multiple_paths(app_name):
     if app_name == "YouTube Music": return []
 
-    # 1. METODO NATIVO APPLE (Word, Excel, Anteprima)
+    # 1. METODO NATIVO APPLE (Office, Anteprima)
     app_target = "Preview" if app_name in ["Anteprima", "Preview"] else app_name
     doc_entities = {
         "Preview": ("document", "path"),
@@ -147,28 +147,42 @@ def get_multiple_paths(app_name):
         res = run_applescript(script)
         return [p.strip() for p in res.split(",") if p.strip()] if res else []
 
-    # 2. METODO UNIX "SPY" (Per MATLAB)
-    elif "MATLAB" in app_name:
-        # Cerchiamo script, workspace, simulink e figure
-        matlab_exts = [".m", ".mat", ".slx", ".mlx", ".fig", ".mdl"]
+    # 2. METODO UNIX "SPY" (Per MATLAB e Applicazioni Sviluppo)
+    # Lista di app da scansionare via lsof
+    dev_apps = ["MATLAB", "PyCharm", "Visual Studio Code", "Code", "IntelliJ IDEA", "Sublime Text", "WebStorm"]
+
+    if any(dev.lower() in app_name.lower() for dev in dev_apps):
+        # Estensioni da monitorare (matlab + programmazione)
+        dev_exts = [
+            ".m", ".mat", ".slx", ".mlx", ".fig",  # MATLAB
+            ".py", ".ipynb",  # Python
+            ".js", ".ts", ".html", ".css",  # Web
+            ".java", ".cpp", ".c", ".h", ".cs",  # System
+            ".json", ".yaml", ".xml", ".sql"  # Data
+        ]
         try:
-            # Troviamo il Process ID (PID) di MATLAB
-            pids_str = subprocess.run(["pgrep", "-i", "matlab"], capture_output=True, text=True).stdout.strip()
-            if not pids_str: return []
+            # Trova il PID dell'app (es. 'PyCharm' o 'Code')
+            pids_str = subprocess.run(["pgrep", "-i", app_name], capture_output=True, text=True).stdout.strip()
+            if not pids_str:
+                # Prova con il nome abbreviato per VS Code
+                if "Code" in app_name:
+                    pids_str = subprocess.run(["pgrep", "-i", "Electron"], capture_output=True,
+                                              text=True).stdout.strip()
+                if not pids_str: return []
 
             open_files = set()
             for pid in pids_str.split('\n'):
-                # lsof = List Open Files. Chiediamo al Mac cosa sta toccando quel PID
                 lsof_out = subprocess.run(["lsof", "-p", pid], capture_output=True, text=True).stdout
                 for line in lsof_out.split('\n'):
                     parts = line.split(maxsplit=8)
                     if len(parts) >= 9:
                         path = parts[8]
-                        if any(path.lower().endswith(ext) for ext in matlab_exts) and os.path.exists(path):
-                            open_files.add(path)
+                        if any(path.lower().endswith(ext) for ext in dev_exts) and os.path.exists(path):
+                            # Escludiamo file interni alle librerie o file temporanei
+                            if "/lib/" not in path and "/Contents/" not in path and ".git/" not in path:
+                                open_files.add(path)
             return list(open_files)
-        except Exception as e:
-            print(f"Errore scansione MATLAB: {e}")
+        except:
             return []
 
     return []
@@ -512,7 +526,7 @@ class StudyManagerGUI(ctk.CTk):
                     "Microsoft Excel": ("workbook", "full name"),
                     "Microsoft PowerPoint": ("presentation", "full name")
                 }
-
+                dev_apps_no_close = ["MATLAB", "PyCharm", "Code", "Visual Studio Code", "IntelliJ", "Sublime"]
                 if app_target in doc_entities:
                     entity, prop = doc_entities[app_target]
                     script = f'''
@@ -523,9 +537,8 @@ class StudyManagerGUI(ctk.CTk):
                                 end tell
                                 '''
                     run_applescript(script)
-                elif "MATLAB" in app_name:
-                    # Essendo un'app Java chiusa, MATLAB non permette di chiudere un singolo file .m da fuori.
-                    # Saltiamo la chiusura per non distruggere l'intero workspace dell'utente.
+                elif any(dev.lower() in app_name.lower() for dev in dev_apps_no_close):
+                    # Salta la chiusura del singolo file per evitare conflitti con l'IDE
                     pass
 
             # 3. CHIUSURA APP STANDALONE (Es. WhatsApp, YouTube Music)

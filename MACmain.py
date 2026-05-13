@@ -82,52 +82,114 @@ def run_applescript(script):
         return None
 
 
-def get_all_chrome_tabs():
-    script = '''
-    tell application "Google Chrome"
-        set tabData to {}
-        try
-            repeat with w in windows
-                repeat with t in tabs of w
-                    set end of tabData to (title of t & "###" & URL of t)
+def get_browser_tabs(browser_name):
+    # Safari usa 'name', Chromium usa 'title'
+    if browser_name == "Safari":
+        script = '''
+        tell application "Safari"
+            set tabData to {}
+            try
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        set end of tabData to (name of t & "###" & URL of t)
+                    end repeat
                 end repeat
-            end repeat
-        end try
-        set AppleScript's text item delimiters to "|||"
-        return tabData as text
-    end tell'''
+            end try
+            set AppleScript's text item delimiters to "|||"
+            return tabData as text
+        end tell'''
+    elif browser_name in ["Google Chrome", "Microsoft Edge", "Brave Browser"]:
+        script = f'''
+        tell application "{browser_name}"
+            set tabData to {{}}
+            try
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        set end of tabData to (title of t & "###" & URL of t)
+                    end repeat
+                end repeat
+            end try
+            set AppleScript's text item delimiters to "|||"
+            return tabData as text
+        end tell'''
+    else:
+        return []
+
     res = run_applescript(script)
     if not res: return []
+
     results = []
     seen = set()
     for item in res.split("|||"):
         if "###" in item:
-            title, url = item.split("###")
+            title, url = item.split("###", 1)
             if url not in seen:
-                results.append({"title": title, "url": url})
-                seen.add(url)
+                results.append({"title": title.strip(), "url": url.strip()})
+                seen.add(url.strip())
     return results
 
 
 def get_multiple_paths(app_name):
     if app_name == "YouTube Music": return []
 
+    # 1. METODO NATIVO APPLE (Word, Excel, Anteprima)
     app_target = "Preview" if app_name in ["Anteprima", "Preview"] else app_name
-    doc_entities = {"Preview": ("documents", "path"), "Microsoft Word": ("documents", "full name"),
-                    "Microsoft Excel": ("workbooks", "full name"),
-                    "Microsoft PowerPoint": ("presentations", "full name")}
-    if app_name not in doc_entities: return []
-    entity, prop = doc_entities[app_name]
-    script = f'tell application "{app_target}" to return {prop} of every {entity}'
-    res = run_applescript(script)
-    return [p.strip() for p in res.split(",") if p.strip()] if res else []
+    doc_entities = {
+        "Preview": ("document", "path"),
+        "Microsoft Word": ("document", "full name"),
+        "Microsoft Excel": ("workbook", "full name"),
+        "Microsoft PowerPoint": ("presentation", "full name")
+    }
+
+    if app_target in doc_entities:
+        entity, prop = doc_entities[app_target]
+        script = f'tell application "{app_target}" to return {prop} of every {entity}'
+        res = run_applescript(script)
+        return [p.strip() for p in res.split(",") if p.strip()] if res else []
+
+    # 2. METODO UNIX "SPY" (Per MATLAB)
+    elif "MATLAB" in app_name:
+        # Cerchiamo script, workspace, simulink e figure
+        matlab_exts = [".m", ".mat", ".slx", ".mlx", ".fig", ".mdl"]
+        try:
+            # Troviamo il Process ID (PID) di MATLAB
+            pids_str = subprocess.run(["pgrep", "-i", "matlab"], capture_output=True, text=True).stdout.strip()
+            if not pids_str: return []
+
+            open_files = set()
+            for pid in pids_str.split('\n'):
+                # lsof = List Open Files. Chiediamo al Mac cosa sta toccando quel PID
+                lsof_out = subprocess.run(["lsof", "-p", pid], capture_output=True, text=True).stdout
+                for line in lsof_out.split('\n'):
+                    parts = line.split(maxsplit=8)
+                    if len(parts) >= 9:
+                        path = parts[8]
+                        if any(path.lower().endswith(ext) for ext in matlab_exts) and os.path.exists(path):
+                            open_files.add(path)
+            return list(open_files)
+        except Exception as e:
+            print(f"Errore scansione MATLAB: {e}")
+            return []
+
+    return []
 
 
-def get_active_apps():
+def get_active_apps_info():
     current_script_name = Path(__file__).stem
-    script = 'tell application "System Events" to return name of every application process whose visible is true'
+    script = '''
+    tell application "System Events"
+        set appList to {}
+        repeat with p in (every application process whose visible is true)
+            try
+                set end of appList to (name of p & "###" & POSIX path of file of p)
+            end try
+        end repeat
+        set AppleScript's text item delimiters to "|||"
+        return appList as text
+    end tell
+    '''
     res = run_applescript(script)
-    if not res: return []
+    if not res: return {}
 
     to_ignore = [
         "Finder", "Terminal", "Python", "Code", "System Settings",
@@ -136,11 +198,14 @@ def get_active_apps():
         current_script_name
     ]
 
-    found_apps = []
-    for app in res.split(','):
-        name = app.strip()
-        if name not in to_ignore and "study" not in name.lower():
-            found_apps.append(name)
+    found_apps = {}
+    for item in res.split('|||'):
+        if "###" in item:
+            name, path = item.split("###", 1)
+            name = name.strip()
+            path = path.strip()
+            if name not in to_ignore and "study" not in name.lower():
+                found_apps[name] = path
 
     return found_apps
 
@@ -222,34 +287,54 @@ class StudyManagerGUI(ctk.CTk):
     def _background_scan(self):
         current = {}
         url_profs = self.settings.get("url_profiles", {})
-        active_apps = get_active_apps()
+        active_apps_info = get_active_apps_info()
+        active_app_names = list(active_apps_info.keys())
 
-        # Chrome Scanning (Solo se aperto, evita riavvii indesiderati)
-        if "Google Chrome" in active_apps:
-            for t in get_all_chrome_tabs():
-                prof_name = url_profs.get(t['url'], "Default")
-                display_text = f"🌐 [{prof_name}] {t['title']}"
-                key = f"{t['url']}"
+        # Lista dei browser supportati per la lettura delle schede
+        supported_browsers = ["Google Chrome", "Safari", "Microsoft Edge", "Brave Browser"]
 
-                current[key] = {
-                    "type": "url", "value": t['url'], "parent_app": "Google Chrome",
-                    "text": display_text, "default": False, "profile": prof_name
-                }
+        # 1. BROWSER SCANNING
+        for browser in supported_browsers:
+            if browser in active_app_names:
+                for t in get_browser_tabs(browser):
+                    # Solo Chrome usa i profili nel nostro script per ora
+                    prof_name = url_profs.get(t['url'], "Default") if browser == "Google Chrome" else ""
+                    prof_tag = f"[{prof_name}] " if prof_name else ""
 
-        # Apps & Files Scanning
-        for app in active_apps:
-            if app == "Google Chrome": continue
-            paths = get_multiple_paths(app)
+                    display_text = f"🌐 {prof_tag}{t['title']}"
+                    key = f"{t['url']}"
+
+                    current[key] = {
+                        "type": "url",
+                        "value": t['url'],
+                        "parent_app": browser,  # Salviamo il browser esatto che ha aperto questo link
+                        "text": display_text,
+                        "default": False,
+                        "profile": prof_name
+                    }
+
+        # 2. APPS E FILES SCANNING
+        for app_name, exact_path in active_apps_info.items():
+            if app_name in supported_browsers: continue
+            paths = get_multiple_paths(app_name)
             if paths:
                 for p in paths:
                     key = p
-                    current[key] = {"type": "file", "value": p, "parent_app": app, "text": f"📄 {os.path.basename(p)}",
-                                    "default": True}
+                    current[key] = {"type": "file", "value": p, "parent_app": app_name,
+                                    "text": f"📄 {os.path.basename(p)}", "default": True}
             else:
-                key = app
-                icon = "🎵" if app == "YouTube Music" else "🖥️"
-                current[key] = {"type": "app", "value": app, "parent_app": app, "text": f"{icon} {app}",
-                                "default": True}
+                key = app_name
+                icon = "🎵" if app_name == "YouTube Music" else "🖥️"
+
+                # NUOVO: Salviamo l'exact_path direttamente nell'oggetto
+                current[key] = {
+                    "type": "app",
+                    "value": app_name,
+                    "app_path": exact_path,  # <-- Memorizziamo il percorso reale
+                    "parent_app": app_name,
+                    "text": f"{icon} {app_name}",
+                    "default": True
+                }
 
         self.after(0, lambda: self._apply_results(current))
 
@@ -385,27 +470,40 @@ class StudyManagerGUI(ctk.CTk):
             # Facciamo l'escape di eventuali virgolette nel nome o nell'URL per non rompere l'AppleScript
             val = item["value"].replace('"', '\\"')
 
-            # 1. CHIUSURA CHIRURGICA TAB DI CHROME
-            if i_type == "url" and app_name == "Google Chrome":
-                script = f'''
-                tell application "Google Chrome"
-                    try
-                        repeat with w in windows
-                            set i to 1
-                            repeat while i ≤ (count of tabs of w)
-                                if URL of tab i of w is "{val}" then
-                                    close tab i of w
-                                else
-                                    set i to i + 1
-                                end if
-                            end repeat
-                        end repeat
-                    end try
-                end tell
-                '''
-                run_applescript(script)
+            # 1. CHIUSURA CHIRURGICA TAB DEI BROWSER
+            if i_type == "url":
+                if app_name == "Safari":
+                    # Safari ha una sintassi AppleScript più diretta per chiudere gli URL
+                    script = f'''
+                                tell application "Safari"
+                                    try
+                                        close (every tab of every window whose URL is "{val}")
+                                    end try
+                                end tell
+                                '''
+                    run_applescript(script)
 
-            # 2. CHIUSURA CHIRURGICA SINGOLI FILE/DOCUMENTI
+                elif app_name in ["Google Chrome", "Microsoft Edge", "Brave Browser"]:
+                    # Chromium necessita del loop manuale
+                    script = f'''
+                                tell application "{app_name}"
+                                    try
+                                        repeat with w in windows
+                                            set i to 1
+                                            repeat while i ≤ (count of tabs of w)
+                                                if URL of tab i of w is "{val}" then
+                                                    close tab i of w
+                                                else
+                                                    set i to i + 1
+                                                end if
+                                            end repeat
+                                        end repeat
+                                    end try
+                                end tell
+                                '''
+                    run_applescript(script)
+
+                    # 2. CHIUSURA CHIRURGICA SINGOLI FILE/DOCUMENTI
             elif i_type == "file":
                 app_target = "Preview" if app_name in ["Anteprima", "Preview"] else app_name
                 doc_entities = {
@@ -418,13 +516,17 @@ class StudyManagerGUI(ctk.CTk):
                 if app_target in doc_entities:
                     entity, prop = doc_entities[app_target]
                     script = f'''
-                    tell application "{app_target}"
-                        try
-                            close (every {entity} whose {prop} is "{val}")
-                        end try
-                    end tell
-                    '''
+                                tell application "{app_target}"
+                                    try
+                                        close (every {entity} whose {prop} is "{val}")
+                                    end try
+                                end tell
+                                '''
                     run_applescript(script)
+                elif "MATLAB" in app_name:
+                    # Essendo un'app Java chiusa, MATLAB non permette di chiudere un singolo file .m da fuori.
+                    # Saltiamo la chiusura per non distruggere l'intero workspace dell'utente.
+                    pass
 
             # 3. CHIUSURA APP STANDALONE (Es. WhatsApp, YouTube Music)
             elif i_type == "app":
@@ -542,48 +644,77 @@ class StudyManagerGUI(ctk.CTk):
             messagebox.showerror("Error", f"Failed to load session file: {e}")
             return
 
-        # Recuperiamo gli URL già aperti per evitare duplicati
+        # ---------------------------------------------------------
+        # NOVITÀ: Recuperiamo gli URL aperti da TUTTI i browser supportati
+        # ---------------------------------------------------------
         open_urls = []
-        if "Google Chrome" in get_active_apps():
-            open_urls = [t['url'] for t in get_all_chrome_tabs()]
+        active_apps = list(get_active_apps_info().keys())
+        supported_browsers = ["Google Chrome", "Safari", "Microsoft Edge", "Brave Browser"]
+
+        for browser in supported_browsers:
+            if browser in active_apps:
+                # Estende la lista con gli url trovati nel browser specifico
+                open_urls.extend([t['url'] for t in get_browser_tabs(browser)])
 
         chrome_bin = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
-        # 1. GESTIONE APPLICAZIONI (Tornata semplice e pulita per le vere App come WhatsApp)
+        # 1. GESTIONE APPLICAZIONI (Resiliente e Dinamica)
         for i in self.saved_data:
             if i["type"] == "app":
                 app_name = i["value"]
-                # Cerca di aprire l'app nativa. Il flag -a dice a macOS di cercare l'applicazione ovunque sia.
-                subprocess.run(["open", "-a", app_name])
+                app_path = i.get("app_path")  # Estrae il percorso esatto dal JSON
+
+                if app_path and os.path.exists(app_path):
+                    # Lancia l'applicazione esattamente da dove girava quando l'hai salvata
+                    subprocess.run(["open", app_path])
+                else:
+                    # Fallback di sicurezza per le vecchie sessioni (se l'app_path non c'è)
+                    subprocess.run(["open", "-a", app_name])
+
                 time.sleep(0.5)
 
-        # 2. GESTIONE FILE (Documenti, PDF, ecc.)
+                # 2. GESTIONE FILE (Documenti, PDF, MATLAB, ecc.)
         for i in self.saved_data:
             if i["type"] == "file":
-                subprocess.run(["open", i["value"]])
+                app_name = i.get("parent_app")
+                if app_name:
+                    # FIX FONDAMENTALE: Usiamo '-a app_name' per forzare l'applicazione madre.
+                    # Questo impedisce a macOS di aprire i file .m di MATLAB dentro Xcode!
+                    subprocess.run(["open", "-a", app_name, i["value"]])
+                else:
+                    # Fallback per vecchi salvataggi
+                    subprocess.run(["open", i["value"]])
 
-        # 3. GESTIONE URL CHROME
+                time.sleep(0.5)
+
+        # ---------------------------------------------------------
+        # NOVITÀ: GESTIONE URL MULTI-BROWSER (Blocco 3)
+        # ---------------------------------------------------------
         for i in self.saved_data:
-            if i["type"] == "url" and i["parent_app"] == "Google Chrome":
+            if i["type"] == "url":
+                # Fallback "Google Chrome" per i vecchi salvataggi senza parent_app
+                app_name = i.get("parent_app", "Google Chrome")
 
                 if i["value"] in open_urls:
                     continue
 
-                folder = self.settings.get("url_profiles", {}).get(i["value"], "Default")
-
-                # ---> LA MOSSA DEL CAVALLO PER YOUTUBE MUSIC <---
+                # ---> LA MOSSA DEL CAVALLO PER YOUTUBE MUSIC (Rimane invariata) <---
                 if "music.youtube.com" in i["value"]:
-                    # Intercettiamo l'URL e forziamo l'apertura dell'App fisica!
-                    # L'app fisica sa già in automatico quale profilo e utente usare.
                     subprocess.run(["open", "-a", "YouTube Music"])
                     time.sleep(0.5)
-                    continue  # Passa al prossimo link
+                    continue
 
-                # ---> APERTURA TAB NORMALI BROWSER <---
-                if os.path.exists(chrome_bin):
-                    subprocess.Popen([chrome_bin, f"--profile-directory={folder}", i['value']])
-                else:
-                    os.system(f"open -na 'Google Chrome' --args --profile-directory='{folder}' '{i['value']}'")
+                    # ---> APERTURA BROWSER SPECIFICO <---
+                if app_name == "Google Chrome":
+                    folder = self.settings.get("url_profiles", {}).get(i["value"], "Default")
+                    if os.path.exists(chrome_bin):
+                        subprocess.Popen([chrome_bin, f"--profile-directory={folder}", i['value']])
+                    else:
+                        os.system(f"open -na 'Google Chrome' --args --profile-directory='{folder}' '{i['value']}'")
+
+                elif app_name in ["Safari", "Microsoft Edge", "Brave Browser"]:
+                    # Per Safari, Edge e Brave usiamo il comando standard e infallibile di macOS
+                    subprocess.run(["open", "-a", app_name, i["value"]])
 
                 time.sleep(0.5)
 

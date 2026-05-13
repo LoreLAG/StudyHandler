@@ -132,6 +132,38 @@ def get_browser_tabs(browser_name):
 def get_multiple_paths(app_name):
     if app_name in ["YouTube Music", "Spotify", "WhatsApp"]: return []
 
+    # 0. METODO FINDER (Antidoto URL + Indice Numerico)
+    if app_name == "Finder":
+        import urllib.parse
+        script = '''
+        tell application "Finder"
+            set folderPaths to {}
+            try
+                set winCount to count of Finder windows
+                repeat with i from 1 to winCount
+                    try
+                        set theUrl to URL of (target of Finder window i)
+                        if theUrl is not missing value then
+                            set end of folderPaths to theUrl
+                        end if
+                    end try
+                end repeat
+            end try
+            set AppleScript's text item delimiters to "|||"
+            return folderPaths as text
+        end tell
+        '''
+        res = run_applescript(script)
+        if not res: return []
+        paths = []
+        for p in res.split("|||"):
+            p = p.strip()
+            if p.startswith("file://"):
+                clean_path = urllib.parse.unquote(p[7:])
+                if os.path.isdir(clean_path):
+                    paths.append(clean_path)
+        return list(set(paths))
+
     # 1. METODO APPLE (Office, Anteprima)
     app_target = "Preview" if app_name in ["Anteprima", "Preview"] else app_name
     doc_entities = {
@@ -147,19 +179,34 @@ def get_multiple_paths(app_name):
         res = run_applescript(script)
         return [p.strip() for p in res.split(",") if p.strip() and "/" in p] if res else []
 
-    # 2. METODO "WINDOW TITLE + SPOTLIGHT" (L'antidoto per PyCharm, VS Code, ecc.)
+    # 2. METODO "WINDOW TITLE" (IDE + FIX SCHERMO INTERO)
     ide_apps = ["PyCharm", "Code", "Visual Studio Code", "IntelliJ", "Sublime", "WebStorm"]
-
     if any(ide.lower() in app_name.lower() for ide in ide_apps):
-        # Chiediamo ad AppleScript di leggere i titoli delle finestre aperte dell'IDE
+        # Usiamo un timeout brevissimo per evitare che l'app GUI si blocchi se PyCharm non risponde
         script = f'''
-        tell application "System Events"
-            try
-                set winNames to name of every window of application process "{app_name}"
-                set AppleScript's text item delimiters to "|||"
-                return winNames as text
-            end try
-        end tell
+        with timeout of 1 second
+            tell application "System Events"
+                try
+                    set proc to (first process whose name contains "{app_name}")
+                    set allNames to {{}}
+                    -- Proviamo a prendere il titolo standard
+                    try
+                        set winNames to name of every window of proc
+                        set allNames to allNames & winNames
+                    end try
+                    -- Proviamo a prendere AXTitle (per il Full Screen)
+                    try
+                        set axNames to value of attribute "AXTitle" of every window of proc
+                        set allNames to allNames & axNames
+                    end try
+
+                    set AppleScript's text item delimiters to "|||"
+                    return allNames as text
+                on error
+                    return ""
+                end try
+            end tell
+        end timeout
         '''
         res = run_applescript(script)
         if not res: return []
@@ -167,48 +214,42 @@ def get_multiple_paths(app_name):
         projects = set()
         for title in res.split("|||"):
             title = title.strip()
-            if not title or title == app_name or title == "missing value": continue
+            if not title or title == "missing value" or title == app_name or len(title) < 3: continue
 
-            # Caso A: Il percorso è direttamente nel titolo tra parentesi: "MioProg [~/percorso/MioProg] - main.py"
+            # Caso A: Percorso tra parentesi
             if " [" in title and "]" in title:
-                possible_path = title.split(" [")[1].split("]")[0]
-                possible_path = os.path.expanduser(possible_path)
-                if os.path.isdir(possible_path):
-                    projects.add(possible_path)
-                    continue
+                p = os.path.expanduser(title.split(" [")[1].split("]")[0])
+                if os.path.isdir(p): projects.add(p)
+                continue
 
-            # Caso B: C'è solo il nome del progetto: "MioProgetto - main.py"
-            proj_name = title.split(' – ')[0].split(' - ')[0].strip()
-            if proj_name:
-                # Usiamo Spotlight per trovare istantaneamente la cartella esatta nel disco!
-                find_cmd = ['mdfind', f'kMDItemContentType == "public.folder" && kMDItemFSName == "{proj_name}"']
-                paths_str = subprocess.run(find_cmd, capture_output=True, text=True).stdout.strip()
-
-                if paths_str:
-                    for p in paths_str.split('\n'):
-                        if os.path.isdir(p):
-                            # Confermiamo che sia un vero progetto controllando se ha le cartelle nascoste di setup
-                            if any(os.path.exists(os.path.join(p, d)) for d in [".idea", ".vscode", ".git"]):
-                                projects.add(p)
-                                break
-
+            # Caso B: Parser Intelligente con mdfind
+            parts = [p.strip() for p in title.replace(' – ', ' - ').split(' - ')]
+            for part in parts:
+                if not part or part in ide_apps: continue
+                find_cmd = ['mdfind', f'kMDItemContentType == "public.folder" && kMDItemFSName == "{part}"']
+                paths = subprocess.run(find_cmd, capture_output=True, text=True).stdout.strip().split('\n')
+                found = False
+                for p in paths:
+                    if p and os.path.isdir(p) and any(
+                            os.path.exists(os.path.join(p, d)) for d in [".idea", ".vscode", ".git"]):
+                        projects.add(p)
+                        found = True
+                        break
+                if found: break
         return list(projects)
 
-    # 3. METODO UNIX LSOF (Solo per MATLAB, che tiene fisicamente i file bloccati in RAM)
+    # 3. METODO MATLAB
     if "MATLAB" in app_name:
         try:
             pid_script = f'tell application "System Events" to return unix id of application process "{app_name}"'
             main_pid = run_applescript(pid_script)
             if not main_pid or not main_pid.isdigit(): return []
-
             pids = [main_pid]
             child_pids = subprocess.run(["pgrep", "-P", main_pid], capture_output=True,
                                         text=True).stdout.strip().split()
             pids.extend(child_pids)
-
             pid_list = ",".join(set(pids))
             open_items = set()
-
             lsof_out = subprocess.run(["lsof", "-p", pid_list], capture_output=True, text=True).stdout
             for line in lsof_out.split('\n'):
                 parts = line.split(maxsplit=8)
@@ -220,7 +261,6 @@ def get_multiple_paths(app_name):
             return list(open_items)
         except:
             return []
-
     return []
 
 
@@ -242,7 +282,7 @@ def get_active_apps_info():
     if not res: return {}
 
     to_ignore = [
-        "Finder", "Terminal", "Python", "Code", "System Settings",
+        "Terminal", "Python", "System Settings",
         "app_mode_loader", "Activity Monitor",
         "Study Manager", "Study Handler", "StudyManager", "StudyHandler",
         current_script_name
@@ -353,25 +393,30 @@ class StudyManagerGUI(ctk.CTk):
                         "default": False
                     }
 
-        # 2. SCANNER APPLICAZIONI E FILE (MATLAB, PyCharm, Word, etc.)
+        # 2. SCANNER APPLICAZIONI E FILE (MATLAB, PyCharm, Word, Finder, etc.)
         for app_name, exact_path in active_apps_info.items():
             if app_name in supported_browsers: continue
 
             # Chiediamo quali file/progetti sono aperti nell'app
             files = get_multiple_paths(app_name)
 
+            # ---> IL FILTRO FANTASMA PER IL FINDER <---
+            if app_name == "Finder" and not files:
+                continue  # Il Finder non ha cartelle aperte? Allora fingiamo che non esista!
+
             if files:
                 # Se ci sono file/progetti, creiamo una riga per ognuno
                 for f_path in files:
                     key = f_path
-                    # Scegliamo l'icona giusta: Cartella per i progetti, foglio per i file
+                    # Scegliamo l'icona giusta: Cartella per Finder/Ide, foglio per i file
                     icon = "📁" if os.path.isdir(f_path) else "📄"
 
                     current[key] = {
-                        "type": "file",  # Usiamo 'file' perché passiamo un percorso al terminale
+                        "type": "file",  # Trattiamo la cartella come file per il comando 'open'
                         "value": f_path,
                         "parent_app": app_name,
-                        "text": f"{icon} {os.path.basename(f_path)}",
+                        "text": f"{icon} {os.path.basename(f_path.rstrip('/'))}",
+                        # Rimuoviamo lo slash finale per estetica
                         "default": True
                     }
             else:
@@ -526,35 +571,35 @@ class StudyManagerGUI(ctk.CTk):
                 if app_name == "Safari":
                     # Safari ha una sintassi AppleScript più diretta per chiudere gli URL
                     script = f'''
-                                tell application "Safari"
-                                    try
-                                        close (every tab of every window whose URL is "{val}")
-                                    end try
-                                end tell
-                                '''
+                    tell application "Safari"
+                        try
+                            close (every tab of every window whose URL is "{val}")
+                        end try
+                    end tell
+                    '''
                     run_applescript(script)
 
                 elif app_name in ["Google Chrome", "Microsoft Edge", "Brave Browser"]:
                     # Chromium necessita del loop manuale
                     script = f'''
-                                tell application "{app_name}"
-                                    try
-                                        repeat with w in windows
-                                            set i to 1
-                                            repeat while i ≤ (count of tabs of w)
-                                                if URL of tab i of w is "{val}" then
-                                                    close tab i of w
-                                                else
-                                                    set i to i + 1
-                                                end if
-                                            end repeat
-                                        end repeat
-                                    end try
-                                end tell
-                                '''
+                    tell application "{app_name}"
+                        try
+                            repeat with w in windows
+                                set i to 1
+                                repeat while i ≤ (count of tabs of w)
+                                    if URL of tab i of w is "{val}" then
+                                        close tab i of w
+                                    else
+                                        set i to i + 1
+                                    end if
+                                end repeat
+                            end repeat
+                        end try
+                    end tell
+                    '''
                     run_applescript(script)
 
-                    # 2. CHIUSURA CHIRURGICA SINGOLI FILE/DOCUMENTI
+            # 2. CHIUSURA CHIRURGICA SINGOLI FILE/DOCUMENTI/CARTELLE
             elif i_type == "file":
                 app_target = "Preview" if app_name in ["Anteprima", "Preview"] else app_name
                 doc_entities = {
@@ -564,16 +609,42 @@ class StudyManagerGUI(ctk.CTk):
                     "Microsoft PowerPoint": ("presentation", "full name")
                 }
                 dev_apps_no_close = ["MATLAB", "PyCharm", "Code", "Visual Studio Code", "IntelliJ", "Sublime"]
-                if app_target in doc_entities:
+
+                # ---> NUOVO: Chiusura specifica per il Finder (Tramite URL sicuro e Ciclo Inverso) <---
+                if app_target == "Finder":
+                    import urllib.parse
+                    folder_path = val if val.endswith('/') else val + '/'
+                    target_url = "file://" + urllib.parse.quote(folder_path, safe='/')
+
+                    script = f'''
+                    tell application "Finder"
+                        try
+                            set winCount to count of Finder windows
+                            -- Cicliamo all'indietro per non perdere il conto quando chiudiamo le finestre
+                            repeat with i from winCount to 1 by -1
+                                try
+                                    if URL of (target of Finder window i) is "{target_url}" then
+                                        close Finder window i
+                                    end if
+                                end try
+                            end repeat
+                        end try
+                    end tell
+                    '''
+                    run_applescript(script)
+
+                # ---> VECCHIO: Chiusura per Office/Anteprima <---
+                elif app_target in doc_entities:
                     entity, prop = doc_entities[app_target]
                     script = f'''
-                                tell application "{app_target}"
-                                    try
-                                        close (every {entity} whose {prop} is "{val}")
-                                    end try
-                                end tell
-                                '''
+                    tell application "{app_target}"
+                        try
+                            close (every {entity} whose {prop} is "{val}")
+                        end try
+                    end tell
+                    '''
                     run_applescript(script)
+
                 elif any(dev.lower() in app_name.lower() for dev in dev_apps_no_close):
                     # Salta la chiusura del singolo file per evitare conflitti con l'IDE
                     pass

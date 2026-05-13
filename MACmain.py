@@ -124,7 +124,7 @@ def get_active_apps():
     script = 'tell application "System Events" to return name of every application process whose visible is true'
     res = run_applescript(script)
     if not res: return []
-    to_ignore = ["Finder", "Terminal", "Python", "Study Manager", "Code", "System Settings", "app_mode_loader"]
+    to_ignore = ["Finder", "Terminal", "Python", "Study Handler", "Study Manager", "StudyHandler", "Code", "System Settings", "app_mode_loader"]
     return [app.strip() for app in res.split(',') if app.strip() not in to_ignore]
 
 

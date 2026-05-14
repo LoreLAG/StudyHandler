@@ -8,16 +8,17 @@ import threading
 import platform
 from pathlib import Path
 import time
+import urllib.parse
+import plistlib
+from PIL import Image
 
 # --- MAC DARK MODE FIX ---
 _original_mac_ver = platform.mac_ver
-
 
 def _patched_mac_ver():
     ver = _original_mac_ver()
     if not ver[0]: return ('10.15.0', ('', '', ''), 'x86_64')
     return ver
-
 
 platform.mac_ver = _patched_mac_ver
 
@@ -29,10 +30,10 @@ APP_DIR = os.path.expanduser("~/.study_manager")
 SESSIONS_DIR = os.path.join(APP_DIR, "sessions")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 CHROME_USER_DATA = os.path.expanduser("~/Library/Application Support/Google/Chrome")
-
+ICONS_DIR = os.path.join(APP_DIR, "icons")
 
 def setup():
-    for d in [APP_DIR, SESSIONS_DIR]:
+    for d in [APP_DIR, SESSIONS_DIR, ICONS_DIR]:
         if not os.path.exists(d): os.makedirs(d)
     if not os.path.exists(SETTINGS_FILE):
         with open(SETTINGS_FILE, 'w') as f:
@@ -129,12 +130,82 @@ def get_browser_tabs(browser_name):
     return results
 
 
+def get_active_apps_info():
+    current_script_name = Path(__file__).stem
+    script = '''
+    tell application "System Events"
+        set appList to {}
+        repeat with p in (every application process whose visible is true)
+            try
+                set end of appList to (name of p & "###" & POSIX path of file of p)
+            end try
+        end repeat
+        set AppleScript's text item delimiters to "|||"
+        return appList as text
+    end tell
+    '''
+    res = run_applescript(script)
+    if not res: return {}
+
+    to_ignore = [
+        "Terminal", "Python", "System Settings",
+        "app_mode_loader", "Activity Monitor",
+        "Study Manager", "Study Handler", "StudyManager", "StudyHandler",
+        current_script_name
+    ]
+
+    found_apps = {}
+    for item in res.split('|||'):
+        if "###" in item:
+            name, path = item.split("###", 1)
+            name = name.strip()
+            path = path.strip()
+            if name not in to_ignore and "study" not in name.lower():
+                found_apps[name] = path
+
+    return found_apps
+
+
+def get_app_icon(app_path, app_name):
+    if not app_path or not app_path.endswith('.app'):
+        return None
+
+    png_path = os.path.join(ICONS_DIR, f"{app_name}.png")
+
+    # 1. Se abbiamo già convertito l'icona in passato, usiamo la cache! (Velocissimo)
+    if os.path.exists(png_path):
+        return ctk.CTkImage(light_image=Image.open(png_path), size=(20, 20))
+
+    # 2. Se è la prima volta, esploriamo l'app per trovare l'icona
+    try:
+        plist_path = os.path.join(app_path, "Contents", "Info.plist")
+        with open(plist_path, 'rb') as f:
+            plist = plistlib.load(f)
+
+        icon_name = plist.get('CFBundleIconFile', '')
+        if not icon_name.endswith('.icns'):
+            icon_name += '.icns'
+
+        icns_path = os.path.join(app_path, "Contents", "Resources", icon_name)
+
+        # 3. Chiediamo a macOS di convertire il file .icns in .png
+        if os.path.exists(icns_path):
+            subprocess.run(['sips', '-s', 'format', 'png', icns_path, '--out', png_path], capture_output=True)
+            if os.path.exists(png_path):
+                return ctk.CTkImage(light_image=Image.open(png_path), size=(20, 20))
+    except Exception as e:
+        print(f"Errore estrazione icona per {app_name}: {e}")
+
+    return None
 def get_multiple_paths(app_name):
+    # Inizializziamo la memoria "Smart Mirror" legata alla funzione
+    if not hasattr(get_multiple_paths, "ide_memory"):
+        get_multiple_paths.ide_memory = {}
+
     if app_name in ["YouTube Music", "Spotify", "WhatsApp"]: return []
 
-    # 0. METODO FINDER (Antidoto URL + Indice Numerico)
+    # 0. METODO FINDER (Antidoto URL)
     if app_name == "Finder":
-        import urllib.parse
         script = '''
         tell application "Finder"
             set folderPaths to {}
@@ -179,66 +250,100 @@ def get_multiple_paths(app_name):
         res = run_applescript(script)
         return [p.strip() for p in res.split(",") if p.strip() and "/" in p] if res else []
 
-    # 2. METODO "WINDOW TITLE" (IDE + FIX SCHERMO INTERO)
+    # 2. METODO "WINDOW TITLE" + SMART MIRROR MAC
     ide_apps = ["PyCharm", "Code", "Visual Studio Code", "IntelliJ", "Sublime", "WebStorm"]
     if any(ide.lower() in app_name.lower() for ide in ide_apps):
-        # Usiamo un timeout brevissimo per evitare che l'app GUI si blocchi se PyCharm non risponde
+        # Chiediamo al Mac i titoli E se l'app è attualmente in primo piano (frontmost)
         script = f'''
-        with timeout of 1 second
-            tell application "System Events"
-                try
-                    set proc to (first process whose name contains "{app_name}")
-                    set allNames to {{}}
-                    -- Proviamo a prendere il titolo standard
+        tell application "System Events"
+            try
+                set proc to (first process whose name contains "{app_name}")
+                set isFront to frontmost of proc
+                set allNames to {{}}
+                set winList to every window of proc
+                repeat with w in winList
                     try
-                        set winNames to name of every window of proc
-                        set allNames to allNames & winNames
+                        set wName to name of w
+                        if wName is not missing value and wName is not "" then set end of allNames to wName
                     end try
-                    -- Proviamo a prendere AXTitle (per il Full Screen)
                     try
-                        set axNames to value of attribute "AXTitle" of every window of proc
-                        set allNames to allNames & axNames
+                        set axName to value of attribute "AXTitle" of w
+                        if axName is not missing value and axName is not "" then set end of allNames to axName
                     end try
-
-                    set AppleScript's text item delimiters to "|||"
-                    return allNames as text
-                on error
-                    return ""
-                end try
-            end tell
-        end timeout
+                end repeat
+                set AppleScript's text item delimiters to "|||"
+                return (isFront as text) & "###" & (allNames as text)
+            on error
+                return "false###"
+            end try
+        end tell
         '''
         res = run_applescript(script)
         if not res: return []
 
+        parts = res.split("###")
+        is_front = (parts[0] == "true")
+        raw_titles = parts[1] if len(parts) > 1 else ""
+
         projects = set()
-        for title in res.split("|||"):
-            title = title.strip()
-            if not title or title == "missing value" or title == app_name or len(title) < 3: continue
+        if raw_titles:
+            for title in raw_titles.split("|||"):
+                title = title.strip()
+                if not title or title == "missing value" or title == app_name or len(title) < 3: continue
 
-            # Caso A: Percorso tra parentesi
-            if " [" in title and "]" in title:
-                p = os.path.expanduser(title.split(" [")[1].split("]")[0])
-                if os.path.isdir(p): projects.add(p)
-                continue
+                if " [" in title and "]" in title:
+                    p = os.path.expanduser(title.split(" [")[1].split("]")[0])
+                    if os.path.isdir(p): projects.add(p)
+                    continue
 
-            # Caso B: Parser Intelligente con mdfind
-            parts = [p.strip() for p in title.replace(' – ', ' - ').split(' - ')]
-            for part in parts:
-                if not part or part in ide_apps: continue
-                find_cmd = ['mdfind', f'kMDItemContentType == "public.folder" && kMDItemFSName == "{part}"']
-                paths = subprocess.run(find_cmd, capture_output=True, text=True).stdout.strip().split('\n')
-                found = False
-                for p in paths:
-                    if p and os.path.isdir(p) and any(
-                            os.path.exists(os.path.join(p, d)) for d in [".idea", ".vscode", ".git"]):
-                        projects.add(p)
-                        found = True
-                        break
-                if found: break
-        return list(projects)
+                clean_title = title.replace('–', '-').replace('—', '-')
+                title_parts = [p.strip() for p in clean_title.split('-')]
 
-    # 3. METODO MATLAB
+                for part in title_parts:
+                    if not part or part in ide_apps or len(part) < 2: continue
+                    found = False
+
+                    # 1. Ricerca rapida nelle cartelle tipiche
+                    common_dirs = ["~/PycharmProjects", "~/Developer", "~/Documents", "~/Desktop", "~/IdeaProjects",
+                                   "~"]
+                    for base in common_dirs:
+                        guess = os.path.expanduser(f"{base}/{part}")
+                        if os.path.isdir(guess) and any(
+                                os.path.exists(os.path.join(guess, d)) for d in [".idea", ".vscode", ".git"]):
+                            projects.add(guess)
+                            found = True
+                            break
+                    if found: break
+
+                    # 2. Ricerca Spotlight
+                    find_cmd = ['mdfind', f'kMDItemContentType == "public.folder" && kMDItemFSName == "{part}"']
+                    paths = subprocess.run(find_cmd, capture_output=True, text=True).stdout.strip().split('\n')
+                    for p in paths:
+                        if p and os.path.isdir(p) and any(
+                                os.path.exists(os.path.join(p, d)) for d in [".idea", ".vscode", ".git"]):
+                            projects.add(p)
+                            found = True
+                            break
+                    if found: break
+
+        found_projects = list(projects)
+
+        # === LA MAGIA DELLO SMART MIRROR ===
+        if is_front:
+            # Sei su PyCharm! Ci fidiamo della lettura. Se è vuota, l'hai chiuso sul serio.
+            get_multiple_paths.ide_memory[app_name] = found_projects
+            return found_projects
+        else:
+            # Sei su un'altra app. Il Mac oscura la UI.
+            if found_projects:
+                # Se per caso lo legge lo stesso, aggiorniamo la memoria
+                get_multiple_paths.ide_memory[app_name] = found_projects
+                return found_projects
+            else:
+                # Restituiamo l'ultimo stato noto prima che tu cambiassi app
+                return get_multiple_paths.ide_memory.get(app_name, [])
+
+    # 3. METODO UNIX LSOF (Solo per MATLAB)
     if "MATLAB" in app_name:
         try:
             pid_script = f'tell application "System Events" to return unix id of application process "{app_name}"'
@@ -261,43 +366,8 @@ def get_multiple_paths(app_name):
             return list(open_items)
         except:
             return []
+
     return []
-
-
-def get_active_apps_info():
-    current_script_name = Path(__file__).stem
-    script = '''
-    tell application "System Events"
-        set appList to {}
-        repeat with p in (every application process whose visible is true)
-            try
-                set end of appList to (name of p & "###" & POSIX path of file of p)
-            end try
-        end repeat
-        set AppleScript's text item delimiters to "|||"
-        return appList as text
-    end tell
-    '''
-    res = run_applescript(script)
-    if not res: return {}
-
-    to_ignore = [
-        "Terminal", "Python", "System Settings",
-        "app_mode_loader", "Activity Monitor",
-        "Study Manager", "Study Handler", "StudyManager", "StudyHandler",
-        current_script_name
-    ]
-
-    found_apps = {}
-    for item in res.split('|||'):
-        if "###" in item:
-            name, path = item.split("###", 1)
-            name = name.strip()
-            path = path.strip()
-            if name not in to_ignore and "study" not in name.lower():
-                found_apps[name] = path
-
-    return found_apps
 
 
 def center_window(window, width, height):
@@ -416,7 +486,6 @@ class StudyManagerGUI(ctk.CTk):
                         "value": f_path,
                         "parent_app": app_name,
                         "text": f"{icon} {os.path.basename(f_path.rstrip('/'))}",
-                        # Rimuoviamo lo slash finale per estetica
                         "default": True
                     }
             else:
@@ -466,12 +535,36 @@ class StudyManagerGUI(ctk.CTk):
         self.lbl_status.configure(text="Synced" if self.current_session_name else "Ready", text_color="gray")
 
     def _add_checkbox(self, data, key, parent_frame):
-        chk = ctk.CTkCheckBox(parent_frame, text=data["text"], command=self.check_dirty_state)
-        chk.pack(fill="x", padx=(25, 5), pady=2)
+        # Creiamo un mini-frame per la riga
+        item_frame = ctk.CTkFrame(parent_frame, fg_color="transparent")
+        item_frame.pack(fill="x", padx=(25, 5), pady=2)
 
+        # 1. La Checkbox (senza testo)
+        chk = ctk.CTkCheckBox(item_frame, text="", width=24, command=self.check_dirty_state)
+        chk.pack(side="left")
+
+        # 2. L'Icona (Se c'è)
+        icon_img = None
+        if data.get("app_path"):
+            # Estraiamo l'icona se abbiamo il percorso dell'app
+            icon_img = get_app_icon(data["app_path"], data["parent_app"])
+
+        if icon_img:
+            # Mostra l'icona reale dell'App
+            lbl_icon = ctk.CTkLabel(item_frame, text="", image=icon_img)
+            lbl_icon.pack(side="left", padx=(0, 5))
+            # Rimuoviamo l'emoji generica dal testo se abbiamo messo l'icona
+            display_text = data["text"].replace("🖥️ ", "").replace("🎵 ", "")
+        else:
+            # Fallback (lasciamo l'emoji per file, cartelle e URL)
+            display_text = data["text"]
+
+        # 3. Il Testo
+        lbl_text = ctk.CTkLabel(item_frame, text=display_text)
+        lbl_text.pack(side="left")
+
+        # --- Logica dei Default (Invariata) ---
         p_app = data["parent_app"]
-
-        # Default Logic
         item_pref = self.settings.get("item_defaults", {}).get(key, None)
         app_pref = self.settings.get("app_defaults", {}).get(p_app, None)
 
@@ -486,7 +579,9 @@ class StudyManagerGUI(ctk.CTk):
 
         self.checkbox_vars[key] = chk
 
-        for widget in [chk, chk._text_label]:
+        # --- Binding del Menu contestuale ---
+        # Colleghiamo il tasto destro a tutta la riga per comodità
+        for widget in [chk, lbl_text] + ([lbl_icon] if icon_img else []):
             widget.bind("<Button-2>", lambda e, k=key, d=data: self.show_context_menu(e, k, d))
             widget.bind("<Button-3>", lambda e, k=key, d=data: self.show_context_menu(e, k, d))
 
@@ -732,7 +827,7 @@ class StudyManagerGUI(ctk.CTk):
             with open(os.path.join(SESSIONS_DIR, f"{c}.json"), 'r') as f: data = json.load(f)
             txt.configure(state="normal");
             txt.delete("1.0", "end")
-            for i in data: txt.insert("end", f"{'🌐' if i['type'] == 'url' else '📄'} {i['parent_app']}: {i['value']}\n")
+            for i in data: txt.insert("end", f"{'🌐' if i['type'] == 'url' else '📄'} {i.get('parent_app', 'Google Chrome')}: {i['value']}\n")
             txt.configure(state="disabled")
 
         if files:
@@ -794,7 +889,7 @@ class StudyManagerGUI(ctk.CTk):
 
                 time.sleep(0.5)
 
-                # 2. GESTIONE FILE (Documenti, PDF, MATLAB, ecc.)
+        # 2. GESTIONE FILE (Documenti, PDF, MATLAB, ecc.)
         for i in self.saved_data:
             if i["type"] == "file":
                 app_name = i.get("parent_app")
@@ -825,7 +920,7 @@ class StudyManagerGUI(ctk.CTk):
                     time.sleep(0.5)
                     continue
 
-                    # ---> APERTURA BROWSER SPECIFICO <---
+                # ---> APERTURA BROWSER SPECIFICO <---
                 if app_name == "Google Chrome":
                     folder = self.settings.get("url_profiles", {}).get(i["value"], "Default")
                     if os.path.exists(chrome_bin):
